@@ -1,0 +1,290 @@
+---
+title: "PoP"
+author: "Erik Jonsson"
+date: "10/3/2021"
+output: html_document
+---
+
+```{r Options setup, include = FALSE}
+
+# Default is to not display code.
+knitr::opts_chunk$set(echo = FALSE)
+
+```
+
+```{r Library loading}
+
+# Load relevant libraries.
+library(openxlsx)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+
+```
+
+```{r Load data}
+
+# Load data.
+data_raw <- read.xlsx("Data/Riksdag.xlsx")
+
+```
+
+```{r Set parameters}
+
+# Number of days after which the weight of a poll goes to zero.
+dtz <- 61
+
+# Initial weight, currently arbitrary.
+init_wt = 1
+
+```
+
+```{r Clean up the data}
+
+# Remove obsolete columns and rename column.
+data <- data_raw %>%
+  select(id, slut, v, s, mp, c, l, kd, m, sd, ovr) %>%
+  rename("end" = slut)
+
+# Convert date column to date format.
+data <- data %>%
+  mutate(end = ymd(end))
+
+# Arrange by date.
+data <- data %>%
+  arrange(end)
+
+```
+
+```{r Initialize end dataset}
+
+# Create dataset with dates from begining to end.
+output <- data.frame(date = seq(min(data$end), Sys.Date(), by = "days"))
+
+```
+
+```{r Fill output}
+
+# Iterate over dates and create data points.
+for (i in 1:nrow(output)) {
+  
+  # Extract dataset with polls relevant to specific date.
+  polls <- data %>%
+    filter(end >= output$date[i] - dtz & end <= output$date[i])
+  
+  # Calculate relevant weight.
+  polls <- polls %>%
+    mutate(x = as.numeric(output$date[i] - end),
+           wt = init_wt * (((init_wt / dtz) ^ (init_wt / dtz))^x))
+  
+  # Recalculate weight so that they sum to one.
+  polls <- polls %>%
+    mutate(wt  = wt / sum(wt))
+  
+  # Clear some columns.
+  polls <- polls %>%
+    select(-id, -x)
+  
+  # Pivot into longer.
+  polls <- polls %>%
+    pivot_longer(-c(end, wt),
+                 names_to = "party",
+                 values_to = "pct")
+  
+  # Calculate interaction between wt and pct.
+  polls <- polls %>%
+    mutate(wt_pct = wt * pct)
+  
+  # Aggregate by party.
+  polls <- polls %>%
+    group_by(party) %>%
+    summarise(pct = sum(wt_pct)) %>%
+    ungroup()
+  
+  # Bench to 100.
+  polls <- polls %>%
+    mutate(pct = pct * (100 / sum(pct)))
+  
+  # Pivot into wider.
+  polls <- polls %>%
+    pivot_wider(id_cols = party,
+                values_from = pct,
+                names_from = party)
+  
+  # Add date.
+  polls <- polls %>%
+    mutate(date = output$date[i]) %>%
+    select(date, everything()) %>%
+    select(!starts_with("ovr"), ovr)
+  
+  # Store data.
+  output <- output %>%
+    bind_rows(polls)
+  
+} ; rm(i)
+
+# Clean output file.
+output <- output %>%
+  filter(!is.na(s))
+
+# Arrange.
+output <- output %>%
+  arrange(date)
+
+# Remove obsolete objects.
+rm(polls)
+
+```
+
+```{r Export}
+
+# Create row with column types.
+types <- output[1,]
+types <- types %>%
+  mutate_all(as.character)
+types[1,1] <- "string"
+types[1,2:ncol(types)] <- "number"
+
+# Convert to character in output.
+output <- output %>%
+  mutate_all(as.character)
+
+# Add column type.
+output <- types %>%
+  bind_rows(output)
+
+# Get date.
+date <- as.character(Sys.Date())
+date <- gsub("-", "", date)
+
+# Export.
+write.csv(output,
+          file = paste("Exports/Output-PoP-", date, ".csv", sep = ""),
+          row.names = F,
+          fileEncoding = "UTF-8")
+
+# Remove obsolete objects.
+rm(types)
+
+```
+
+```{r Mandate rules}
+# There are set mandates and equalizer mandates
+# Set mandates are distributed according to the votes received by a party in a constituency
+# Mandates are distributed one at a time, a mandate goes to the party with the highest comparative number
+# Mandates are calculated by the adjusted odd numbers method.
+
+# Then a total set mandate distribution is calculated, without regard to constituency.
+# If a party is overrepresented in the constituency distribution compared to the total distribution
+# The extra mandates are returned and distributed to the underrepresented parties
+
+# Lastly the equalizer mandates are distributed to parties which got fewer mandates after the above steps
+# than in the total set mandate distribution
+# In this case the odd numbers method is used without adjustment
+
+# There are 310 set mandates and 39 equalizer mandates
+```
+
+```{r Mandate calulations}
+
+# Create long version of output.
+output_long <- output[2:nrow(output),]
+output_long <- output_long %>%
+  pivot_longer(-date,
+               names_to = "party",
+               values_to = "pct") %>%
+  mutate(pct = as.numeric(pct))
+
+# Recalculate support.
+output_long_clean <- output_long %>%
+  filter(pct >= 4) %>%
+  group_by(date) %>%
+  mutate(pct = pct / sum(pct)) %>%
+  ungroup()
+
+# Calculate number of seats.
+seats <- output_long_clean %>%
+  mutate(seats = round(pct * 349, 0))
+
+# Pivot.
+seats <- seats %>%
+  pivot_wider(id_cols = date,
+              names_from = party,
+              values_from = seats) %>%
+  mutate_all(~replace(., is.na(.), 0))
+
+```
+
+```{r}
+tmp <- output %>%
+  filter(!is.na(as.numeric(s))) %>%
+  pivot_longer(-date,
+               values_to = "pct",
+               names_to = "party") %>%
+  mutate(pct = as.numeric(pct)) %>%
+  pivot_wider(id_cols = date,
+              values_from = pct,
+              names_from = party)
+
+write.xlsx(tmp, "tmp.xlsx")
+```
+
+
+```{r Mandate calculations}
+
+# Pivot output.
+output_long <- output[2:nrow(output),]
+output_long <- output_long %>%
+  pivot_longer(-date,
+               names_to = "party",
+               values_to = "pct") %>%
+  mutate(pct = as.numeric(pct))
+
+
+
+# Distribution of set mandates
+# Import data
+antal_fasta_valkretsmandat <- read_excel("Data/2018_antal_fasta_valkretsmandat.xls")
+
+# Cleaning data
+antal_fasta_valkretsmandat <- antal_fasta_valkretsmandat[1:29,1:11]
+
+# Initial distribution
+dataset <- expand.grid(date = unique(output_long$date),
+                       constit = antal_fasta_valkretsmandat$VALKRETS,
+                       party = unique(output_long$party))
+
+# Data manipulation
+dataset <- dataset %>%
+  left_join(antal_fasta_valkretsmandat %>%
+              select(constit = VALKRETS, seats = MANDAT),
+            by = "constit")
+
+# Combining datasets
+dataset <- dataset %>%
+  left_join(output_long,
+            by = c("date", "party"))
+
+# Create version where parties that don't clear threshold are removed.
+dataset <- dataset %>%
+  filter(pct >= 4) %>%
+  group_by(date, constit) %>%
+  mutate(pct = pct / sum(pct)) %>%
+  ungroup()
+
+# Support by date and constituency
+dataset <- dataset %>% 
+           mutate(initial_seat_distrib = pct * seats)
+
+# Seat distribution without constituency
+dataset <- dataset %>% mutate(total_distribution = pct * 310)
+
+#Calculate constituency over representation
+tmp <- dataset %>%
+  group_by(date, party) %>%
+  summarise(var = sum(initial_seat_distrib) - total_distribution) %>%
+  ungroup()
+dataset <- dataset %>% mutate(constit_overrep = sum(inital_seat_distrib$party) - total_distribution)
+
+```
+
