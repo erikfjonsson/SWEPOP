@@ -1,0 +1,320 @@
+---
+title: "PoP"
+author: "Erik Jonsson"
+date: "10/3/2021"
+output: html_document
+---
+
+```{r Options setup, include = FALSE}
+
+# Default is to not display code.
+knitr::opts_chunk$set(echo = FALSE)
+
+```
+
+```{r Library loading}
+
+# Load relevant libraries.
+library(openxlsx)
+library(tidyverse)
+library(lubridate)
+library(readxl)
+
+```
+
+```{r Load data}
+
+# Load data.
+data_raw <- read.xlsx("Data/Riksdag.xlsx")
+
+```
+
+```{r Set parameters}
+
+# Number of days after which the weight of a poll goes to zero.
+dtz <- 61
+
+# Initial weight, currently arbitrary.
+init_wt = 1
+
+```
+
+```{r Clean up the data}
+
+# Remove obsolete columns and rename column.
+data <- data_raw %>%
+  select(id, start, slut, v, s, mp, c, l, kd, m, sd, ovr) %>%
+  rename("end" = slut)
+
+# Convert date column to date format.
+data <- data %>%
+  mutate(start = ymd(start),
+         end = ymd(end))
+
+# Create date that is midpoint of start and end.
+data <- data %>%
+  mutate(mid_date = start + floor((end - start) / 2)) %>%
+  select(-start, -end) %>%
+  select(id, mid_date, everything())
+
+# Arrange by date.
+data <- data %>%
+  arrange(mid_date)
+
+# For now, only keep rows from 2020 onwards.
+data <- data %>%
+  filter(mid_date > as.Date("2020-01-01"))
+
+```
+
+```{r Initialize end dataset}
+
+# Create dataset with dates from begining to end.
+output <- data.frame(date = seq(from = min(data$mid_date),
+                                to = Sys.Date(),
+                                by = "days"))
+
+```
+
+```{r Fill output}
+
+# Iterate over dates and create data points.
+for (i in 1:nrow(output)) {
+  
+  # Extract dataset with polls relevant to specific date.
+  polls <- data %>%
+    filter(mid_date >= output$date[i] - dtz & mid_date <= output$date[i])
+  
+  # Calculate relevant weight.
+  polls <- polls %>%
+    mutate(x = as.numeric(output$date[i] - mid_date),
+           wt = init_wt * (((init_wt / dtz) ^ (init_wt / dtz))^x))
+  
+  # Recalculate weight so that they sum to one.
+  polls <- polls %>%
+    mutate(wt  = wt / sum(wt))
+  
+  # Clear some columns.
+  polls <- polls %>%
+    select(-id, -x)
+  
+  # Pivot into longer.
+  polls <- polls %>%
+    pivot_longer(-c(mid_date, wt),
+                 names_to = "party",
+                 values_to = "pct")
+  
+  # Calculate interaction between wt and pct.
+  polls <- polls %>%
+    mutate(wt_pct = wt * pct)
+  
+  # Aggregate by party.
+  polls <- polls %>%
+    group_by(party) %>%
+    summarise(pct = sum(wt_pct)) %>%
+    ungroup()
+  
+  # Bench to 100.
+  polls <- polls %>%
+    mutate(pct = pct * (100 / sum(pct)))
+  
+  # Pivot into wider.
+  polls <- polls %>%
+    pivot_wider(id_cols = party,
+                values_from = pct,
+                names_from = party)
+  
+  # Add date.
+  polls <- polls %>%
+    mutate(date = output$date[i]) %>%
+    select(date, everything()) %>%
+    select(!starts_with("ovr"), ovr)
+  
+  # Store data.
+  output <- output %>%
+    bind_rows(polls)
+  
+} ; rm(i)
+
+# Clean output file.
+output <- output %>%
+  filter(!is.na(s))
+
+# Arrange.
+output <- output %>%
+  arrange(date)
+
+# Remove obsolete objects.
+rm(polls)
+
+```
+
+```{r Export PoP}
+
+# Create copy for export.
+output_export <- output
+
+# Add four percent line.
+output_export <- output_export %>%
+  mutate(`riksdagsspärr` = 4)
+
+# Export.
+write.csv(output_export,
+          file = "Exports/pop_clean.csv",
+          row.names = F,
+          fileEncoding = "UTF-8")
+
+# Create row with column types.
+types <- output_export[1,]
+types <- types %>%
+  mutate_all(as.character)
+types[1,1] <- "string"
+types[1,2:ncol(types)] <- "number"
+
+# Convert to character in output.
+output_export <- output_export %>%
+  mutate_all(as.character)
+
+# Add column type.
+output_export <- types %>%
+  bind_rows(output_export)
+
+# Export.
+write.csv(output_export,
+          file = "Exports/pop.csv",
+          row.names = F,
+          fileEncoding = "UTF-8")
+
+# Remove obsolete objects.
+rm(types)
+
+```
+
+```{r Seat calulations}
+
+# Create long version of output.
+output_long <- output[2:nrow(output),]
+output_long <- output_long %>%
+  pivot_longer(-date,
+               names_to = "party",
+               values_to = "pct") %>%
+  mutate(pct = as.numeric(pct))
+
+# Recalculate support.
+output_long_clean <- output_long %>%
+  filter(pct >= 4) %>%
+  group_by(date) %>%
+  mutate(pct = pct / sum(pct)) %>%
+  ungroup()
+
+# Calculate number of seats.
+seats <- output_long_clean %>%
+  mutate(seats = round(pct * 349, 0))
+
+# Pivot.
+seats <- seats %>%
+  pivot_wider(id_cols = date,
+              names_from = party,
+              values_from = seats) %>%
+  mutate_if(is.numeric, ~replace(., is.na(.), 0))
+
+# Handle instances where seats do not sum to 349.
+# If number of seats are below 349, add seat to random party.
+# If number of seats are above 349, remove seat from random party with more than 14 seats.
+for (i in 1:nrow(seats)) {
+  
+  # Check seat total.
+  tot <- sum(seats[i,2:ncol(seats)])
+  
+  # If number of seats are below 349, add seat to random party with seats.
+  # If number of seats are above 349, remove seat from random party with more than 14 seats.
+  if (tot < 349) {
+    
+    # Draw party to give seat.
+    vc <- seats[i,2:ncol(seats)] > 0
+    nms <- names(seats[2:ncol(seats)])[vc == T]
+    party <- sample(nms, 1)
+    
+    # Add seat.
+    seats[i, party] <- seats[i, party] + 1
+    
+  } else if (tot > 349) {
+    
+    # Draw party to loose seat.
+    vc <- seats[i,2:ncol(seats)] > 14
+    nms <- names(seats[2:ncol(seats)])[vc == T]
+    party <- sample(nms, 1)
+    
+    # Add seat.
+    seats[i, party] <- seats[i, party] - 1
+    
+  }
+  
+} ; rm(i, tot, vc, nms, party)
+
+# Arrange.
+seats <- seats %>%
+  arrange(date)
+
+```
+
+```{r Export seats}
+
+# Create copy for export.
+seats_export <- seats
+
+# Export.
+write.csv(output_export,
+          file = "Exports/seats_clean.csv",
+          row.names = F,
+          fileEncoding = "UTF-8")
+
+# Create row with column types.
+types <- seats_export[1,]
+types <- types %>%
+  mutate_all(as.character)
+types[1,1] <- "string"
+types[1,2:ncol(types)] <- "number"
+
+# Convert to character in output.
+seats_export <- seats_export %>%
+  mutate_all(as.character)
+
+# Add column type.
+seats_export <- types %>%
+  bind_rows(seats_export)
+
+# Export.
+write.csv(seats_export,
+          file = "Exports/seats.csv",
+          row.names = F,
+          fileEncoding = "UTF-8")
+
+# Only keep latest observation.
+seats_export <- seats_export[c(nrow(seats_export)),]
+
+# Pivot.
+seats_export <- seats_export %>%
+  pivot_longer(-date,
+               names_to = "party",
+               values_to = "seats") %>%
+  select(-date)
+
+# Add type.
+type <- data.frame(party = "string",
+                   seats = "number")
+seats_export <- type %>%
+  bind_rows(seats_export)
+
+# Export.
+write.csv(seats_export,
+          file = "Exports/seats_current.csv",
+          row.names = F,
+          fileEncoding = "UTF-8")
+
+# Remove obsolete objects.
+rm(types, type)
+
+
+```
+
